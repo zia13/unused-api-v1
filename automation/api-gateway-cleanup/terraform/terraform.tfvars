@@ -1,0 +1,17 @@
+aws_region             = "us-east-1"
+environment            = "prod"
+ses_sender_email       = "mdziaur.rahman@corebridgefinancial.com"
+sns_alert_email        = "mdziaur.rahman@corebridgefinancial.com"
+s3_archive_bucket_name = "api-gateway-cleanup-archive-prod"
+dynamodb_table_name    = "api-gateway-inventory"
+lookback_days          = "90"
+low_traffic_threshold  = "10"
+dry_run                = "true"
+soft_delete_window_days = "7"
+notice_period_days      = "30"
+
+# ── Test APIs ─────────────────────────────────────────────────────
+# Set to true to provision the 3 e2e test APIs (active/dormant/orphaned)
+# Set back to false (and terraform apply) to destroy them after testing
+create_test_apis       = true
+

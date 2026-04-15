@@ -1,0 +1,29 @@
+# Terraform local state and provider binaries — never commit these
+.terraform/
+.terraform.lock.hcl
+
+# State files — use remote backend (S3) instead
+*.tfstate
+*.tfstate.backup
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Sensitive variable files
+*.tfvars.local
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Build artefacts (Lambda zips)
+builds/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
