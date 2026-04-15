@@ -19,7 +19,6 @@
 8. [Rollback & Recovery Plan](#8-rollback--recovery-plan)
 9. [Automation Approach](#9-automation-approach)
 10. [Governance & Ongoing Monitoring](#10-governance--ongoing-monitoring)
-11. [Appendix: Reference Commands](#11-appendix-reference-commands)
 
 ---
 
@@ -85,71 +84,10 @@ The default look-back window is **90 days**. Teams can override this per API via
 ### 3.1 Prerequisites
 
 - AWS CLI v2 installed and configured
-- Appropriate IAM permissions (see §3.3)
+- Appropriate IAM permissions (see §3.2)
 - AWS Organizations access (for multi-account discovery)
 
-### 3.2 Step-by-Step Discovery
-
-#### Step 1 — List all active AWS accounts
-
-```bash
-aws organizations list-accounts \
-  --query 'Accounts[?Status==`ACTIVE`].[Id,Name]' \
-  --output table
-```
-
-#### Step 2 — List all enabled regions
-
-```bash
-aws account list-regions \
-  --region-opt-status-contains ENABLED \
-  --query 'Regions[].RegionName' \
-  --output text
-```
-
-#### Step 3 — Enumerate REST APIs (v1) in a region
-
-```bash
-aws apigateway get-rest-apis \
-  --region <REGION> \
-  --query 'items[*].{ID:id,Name:name,Created:createdDate}' \
-  --output table
-```
-
-#### Step 4 — Enumerate HTTP & WebSocket APIs (v2) in a region
-
-```bash
-aws apigatewayv2 get-apis \
-  --region <REGION> \
-  --query 'Items[*].{ID:ApiId,Name:Name,Protocol:ProtocolType,Created:CreatedDate}' \
-  --output table
-```
-
-#### Step 5 — Export inventory to JSON
-
-```bash
-# REST APIs
-aws apigateway get-rest-apis --region <REGION> \
-  --output json > inventory-rest-<REGION>.json
-
-# HTTP + WebSocket APIs
-aws apigatewayv2 get-apis --region <REGION> \
-  --output json > inventory-v2-<REGION>.json
-```
-
-#### Step 6 — Assume cross-account role for multi-account scanning
-
-```bash
-CREDS=$(aws sts assume-role \
-  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/APIGatewayReadOnlyRole \
-  --role-session-name cleanup-scan)
-
-export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
-export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
-export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
-```
-
-### 3.3 Required IAM Permissions
+### 3.2 Required IAM Permissions
 
 ```json
 {
@@ -176,9 +114,9 @@ export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
 }
 ```
 
-### 3.4 AWS Config Aggregator Query
+### 3.3 AWS Config Aggregator Query
 
-For organisations using AWS Config, run the following advanced query to retrieve all API Gateway resources in one call:
+For organisations using AWS Config, the automation uses the following advanced query to retrieve all API Gateway resources in one call:
 
 ```sql
 SELECT
@@ -196,91 +134,33 @@ WHERE
   )
 ```
 
-```bash
-aws configservice select-aggregate-resource-config \
-  --configuration-aggregator-name OrgAggregator \
-  --expression "<SQL above>" \
-  --output json > config-inventory.json
-```
+> Discovery across all accounts and regions is performed automatically by **Lambda: Scanner** (see §9.2). No manual CLI steps are required.
 
 ---
 
 ## 4. Analysis Methodology
 
-### 4.1 Pull Invocation Count per API (CloudWatch)
+The automation pipeline analyses each discovered API against the following signals. All data collection is performed automatically by **Lambda: Scanner** (see §9.2).
 
-```bash
-aws cloudwatch get-metric-statistics \
-  --namespace "AWS/ApiGateway" \
-  --metric-name "Count" \
-  --dimensions Name=ApiName,Value=<API_NAME> \
-  --start-time $(date -u -v-90d '+%Y-%m-%dT%H:%M:%SZ') \
-  --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  --period 7776000 \
-  --statistics Sum \
-  --output json
-```
+### 4.1 Invocation Count (CloudWatch)
 
-> A `Sum` of `0` or a `Datapoints` array that is empty means no traffic in the period.
+The scanner pulls the `Count` metric from the `AWS/ApiGateway` namespace over the configured look-back window (default: 90 days). A `Sum` of `0` or an empty `Datapoints` array means no traffic in the period.
 
-### 4.2 Query Access Logs via CloudWatch Logs Insights
+### 4.2 Access Log Analysis
 
-If access logging is enabled on a stage, run the following Logs Insights query to confirm zero real requests:
+If access logging is enabled on a stage, the scanner queries CloudWatch Logs Insights to confirm zero real requests by counting log entries in the look-back window.
 
-```
-fields @timestamp, @message
-| filter @logStream like /access/
-| stats count() as requestCount by bin(1d)
-| sort @timestamp desc
-| limit 20
-```
+### 4.3 Stages and Deployments
 
-```bash
-aws logs start-query \
-  --log-group-name "API-Gateway-Execution-Logs_<API_ID>/<STAGE>" \
-  --start-time $(date -v-90d +%s) \
-  --end-time $(date +%s) \
-  --query-string 'stats count() as hits | filter @message like /HTTP/' \
-  --output json
-```
+The scanner checks whether each REST API has at least one active stage and deployment. An API with **no stages** or **no deployments** is an immediate candidate for deletion.
 
-### 4.3 Check for Stages and Deployments
+### 4.4 Usage Plans
 
-```bash
-# List stages for a REST API
-aws apigateway get-stages \
-  --rest-api-id <API_ID> \
-  --region <REGION>
+The scanner checks whether each REST API is referenced by a usage plan. APIs not attached to any usage plan have never been formally integrated into a client workflow.
 
-# List deployments
-aws apigateway get-deployments \
-  --rest-api-id <API_ID> \
-  --region <REGION>
-```
+### 4.5 Cost Attribution
 
-An API with **no stages** or **no deployments** is an immediate candidate for deletion.
-
-### 4.4 Check Usage Plans
-
-```bash
-aws apigateway get-usage-plans --region <REGION> \
-  --query 'items[*].{Name:name,APIs:apiStages}' \
-  --output table
-```
-
-APIs not referenced by any usage plan have never been formally integrated into a client workflow.
-
-### 4.5 Cost Attribution via Cost Explorer
-
-```bash
-aws ce get-cost-and-usage \
-  --time-period Start=2026-01-01,End=2026-04-13 \
-  --granularity MONTHLY \
-  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon API Gateway"]}}' \
-  --group-by '[{"Type":"DIMENSION","Key":"USAGE_TYPE"}]' \
-  --metrics "UnblendedCost" \
-  --output table
-```
+Cost data is surfaced via the DynamoDB inventory table and reported in the quarterly cost saving report (§10.3). The automation tags each API record with its estimated monthly cost contribution.
 
 ---
 
@@ -315,19 +195,11 @@ Does the API have any invocations in the last 90 days?
 
 ### 6.1 Owner Identification
 
+The automation resolves the API owner in the following order:
+
 1. Check the `owner` and `team` resource tags on the API.
 2. Fall back to the IAM principal that created the API (CloudTrail lookup).
 3. Fall back to the AWS account owner if no other signal is available.
-
-```bash
-# Check tags on a REST API
-aws apigateway get-tags \
-  --resource-arn arn:aws:apigateway:<REGION>::/restapis/<API_ID>
-
-# Check tags on an HTTP/WebSocket API
-aws apigatewayv2 get-tags \
-  --resource-arn arn:aws:apigateway:<REGION>::/apis/<API_ID>
-```
 
 ### 6.2 Notification Template
 
@@ -397,7 +269,7 @@ Owner approves?  Escalate to team lead
 
 ### 7.1 Pre-Deletion Checklist
 
-Before deleting any API, confirm all of the following:
+Before the automation proceeds with any deletion, the following conditions are automatically verified:
 
 - [ ] API is classified as Dormant or Orphaned (§5)
 - [ ] Owner has been notified and notice period has elapsed (§6)
@@ -409,69 +281,25 @@ Before deleting any API, confirm all of the following:
 
 ### 7.2 Phase 1 — Soft Deprecation (Day 0)
 
-**Disable all usage plans / throttle to zero** (REST APIs):
+Performed automatically by **Lambda: Cleaner** (`CLEANER_MODE=soft`):
 
-```bash
-aws apigateway update-stage \
-  --rest-api-id <API_ID> \
-  --stage-name <STAGE> \
-  --patch-operations '[
-    {"op":"replace","path":"/defaultRouteSettings/throttlingBurstLimit","value":"0"},
-    {"op":"replace","path":"/defaultRouteSettings/throttlingRateLimit","value":"0"}
-  ]'
-```
+- Exports and archives the OpenAPI spec to S3
+- Throttles all stages to 0 requests/second
+- Sets `soft_deleted_at` in the DynamoDB inventory
 
-**Remove custom domain mapping** (if any):
-
-```bash
-# REST API
-aws apigateway delete-base-path-mapping \
-  --domain-name <DOMAIN> \
-  --base-path <BASE_PATH>
-
-# HTTP/WebSocket API
-aws apigatewayv2 delete-api-mapping \
-  --domain-name <DOMAIN> \
-  --api-mapping-id <MAPPING_ID>
-```
-
-**Monitor for 7 days.** If any `Count` metric > 0 appears, halt and re-investigate.
+The pipeline then waits **7 days** (Step Functions Wait state). If any `Count` metric > 0 appears during this window, the pipeline halts and alerts via SNS.
 
 ### 7.3 Phase 2 — Hard Delete (Day 7+)
 
-**Delete REST API (v1):**
+Performed automatically by **Lambda: Cleaner** (`CLEANER_MODE=hard`):
 
-```bash
-aws apigateway delete-rest-api \
-  --rest-api-id <API_ID> \
-  --region <REGION>
-```
-
-**Delete HTTP or WebSocket API (v2):**
-
-```bash
-aws apigatewayv2 delete-api \
-  --api-id <API_ID> \
-  --region <REGION>
-```
+- Calls `delete-rest-api` (v1) or `delete-api` (v2)
+- Sets `deleted_at` in DynamoDB
+- Full audit trail is preserved in DynamoDB and the S3 archive
 
 ### 7.4 Dry-Run Mode
 
-Before running deletions in bulk, always perform a dry run using `--dry-run` (where supported) or by echoing commands:
-
-```bash
-DRY_RUN=true
-
-delete_api() {
-  local api_id=$1
-  local region=$2
-  if [ "$DRY_RUN" = "true" ]; then
-    echo "[DRY RUN] Would delete REST API: $api_id in $region"
-  else
-    aws apigateway delete-rest-api --rest-api-id "$api_id" --region "$region"
-  fi
-}
-```
+The automation defaults to `DRY_RUN=true`. In this mode all pipeline steps execute normally but no real AWS changes are made — throttle calls and delete calls are logged only. Set `DRY_RUN=false` in `terraform.tfvars` to enable live deletions (see §9.6).
 
 ---
 
@@ -479,38 +307,24 @@ delete_api() {
 
 ### 8.1 Pre-Deletion Archival to S3
 
-Export and store the full API definition before any deletion:
+Before any deletion the automation automatically exports the full OpenAPI 3.0 spec and uploads it to the configured S3 archive bucket:
 
-```bash
-# Export OpenAPI 3.0 spec (REST API)
-aws apigateway get-export \
-  --rest-api-id <API_ID> \
-  --stage-name <STAGE> \
-  --export-type oas30 \
-  --accepts application/json \
-  /tmp/<API_ID>-oas30.json
-
-# Upload to S3 archive bucket
-aws s3 cp /tmp/<API_ID>-oas30.json \
-  s3://your-api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json
+```
+s3://your-api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json
 ```
 
-Also export Swagger format for compatibility:
-
-```bash
-aws apigateway get-export \
-  --rest-api-id <API_ID> \
-  --stage-name <STAGE> \
-  --export-type swagger \
-  --accepts application/json \
-  /tmp/<API_ID>-swagger.json
-```
+The S3 bucket is configured with versioning enabled, AES-256 encryption, and a lifecycle policy that transitions objects to Glacier after 90 days with a 7-year retention period.
 
 ### 8.2 Re-Import Procedure
 
-If an API needs to be restored after deletion:
+If an API needs to be restored after deletion, retrieve the archived spec from S3 and re-import:
 
 ```bash
+# Download spec from S3
+aws s3 cp \
+  s3://your-api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json \
+  /tmp/<API_ID>-oas30.json
+
 # Re-import REST API from OpenAPI spec
 aws apigateway import-rest-api \
   --fail-on-warnings \
@@ -670,42 +484,7 @@ All settings are controlled via environment variables on the Lambda functions (s
 
 ---
 
-### 9.5 Quick Start — Manual (CLI)
-
-```bash
-# 1. Install dependencies
-pip install -r automation/api-gateway-cleanup/requirements.txt
-
-# 2. Scan all APIs (dry run, no AWS writes)
-python automation/api-gateway-cleanup/scripts/scan.py \
-  --profile myprofile \
-  --days 90 \
-  --output ./report
-
-# 3. Review report.csv (sorted by severity)
-
-# 4. Archive specs to S3 before deletion
-python automation/api-gateway-cleanup/scripts/archive.py \
-  --report ./report.json \
-  --bucket your-api-archive-bucket \
-  --dry-run
-
-# 5. Soft delete (throttle to zero) — preview first
-python automation/api-gateway-cleanup/scripts/cleanup.py \
-  --report ./report.json --mode soft
-
-# 6. Apply soft delete
-python automation/api-gateway-cleanup/scripts/cleanup.py \
-  --report ./report.json --mode soft --no-dry-run
-
-# 7. Hard delete after monitoring window (7+ days later)
-python automation/api-gateway-cleanup/scripts/cleanup.py \
-  --report ./report.json --mode hard --no-dry-run
-```
-
----
-
-### 9.6 Quick Start — Automated (Terraform)
+### 9.5 Quick Start — Automated (Terraform)
 
 ```bash
 # 1. Configure
@@ -733,190 +512,4 @@ terraform apply
 
 ---
 
-### 9.7 EventBridge Schedule
-
-The Step Functions pipeline runs automatically every **Monday at 08:00 UTC** via an EventBridge Scheduler rule (provisioned by Terraform). To trigger on-demand:
-
-```bash
-aws stepfunctions start-execution \
-  --state-machine-arn <STATE_MACHINE_ARN> \
-  --input '{"triggered_by": "manual", "tier_filter": "ORPHANED"}'
-```
-
----
-
-### 9.8 SNS Alert for New Orphaned APIs
-
-```bash
-# Create the alert topic (handled by Terraform, or manually)
-aws sns create-topic --name api-gateway-orphan-alerts
-
-aws sns subscribe \
-  --topic-arn arn:aws:sns:<REGION>:<ACCOUNT_ID>:api-gateway-orphan-alerts \
-  --protocol email \
-  --notification-endpoint mdziaur.rahman@corebridgefinancial.com
-```
-
----
-
-## 10. Governance & Ongoing Monitoring
-
-### 10.1 Mandatory Tagging Policy
-
-All new API Gateway APIs **must** include the following tags at creation time:
-
-| Tag Key | Example Value                        | Required |
-|---|--------------------------------------|---|
-| `owner` | `ritwik.roy@corebridgefinancial.com` | ✅ Yes |
-| `team` | `payments-platform`                  | ✅ Yes |
-| `environment` | `production`                         | ✅ Yes |
-| `project` | `checkout-v2`                        | ✅ Yes |
-| `lifecycle` | `active` or `protected`              | ✅ Yes |
-| `last-reviewed` | `2026-04-13`                         | ✅ Yes |
-| `cost-center` | `CC-1042`                            | ✅ Yes |
-
-Enforce this via an AWS Config rule:
-
-```json
-{
-  "ConfigRuleName": "api-gateway-required-tags",
-  "Source": {
-    "Owner": "AWS",
-    "SourceIdentifier": "REQUIRED_TAGS"
-  },
-  "Scope": {
-    "ComplianceResourceTypes": [
-      "AWS::ApiGateway::RestApi",
-      "AWS::ApiGatewayV2::Api"
-    ]
-  },
-  "InputParameters": "{\"tag1Key\":\"owner\",\"tag2Key\":\"team\",\"tag3Key\":\"environment\",\"tag4Key\":\"lifecycle\"}"
-}
-```
-
-### 10.2 CloudWatch Alarm: Traffic Drop to Zero
-
-Create an alarm that fires when an API's `Count` metric drops to zero for 7 consecutive days:
-
-```bash
-aws cloudwatch put-metric-alarm \
-  --alarm-name "api-zero-traffic-<API_NAME>" \
-  --alarm-description "API has received zero traffic for 7 days" \
-  --namespace "AWS/ApiGateway" \
-  --metric-name "Count" \
-  --dimensions Name=ApiName,Value=<API_NAME> \
-  --statistic Sum \
-  --period 86400 \
-  --evaluation-periods 7 \
-  --threshold 1 \
-  --comparison-operator LessThanThreshold \
-  --treat-missing-data breaching \
-  --alarm-actions arn:aws:sns:<REGION>:<ACCOUNT_ID>:api-gateway-orphan-alerts
-```
-
-### 10.3 Quarterly Review Cadence
-
-| Activity | Frequency | Owner |
-|---|---|---|
-| Full inventory scan | Weekly (automated) | Platform Engineering |
-| Review LOW_TRAFFIC APIs | Monthly | API Owners |
-| Review DORMANT / ORPHANED queue | Bi-weekly | Platform Engineering |
-| Bulk deletion execution | Quarterly | Platform Engineering + Security |
-| Policy and threshold review | Quarterly | Engineering Manager |
-| Cost saving report | Quarterly | FinOps / Cloud Costs team |
-
-### 10.4 Service Catalog Integration
-
-Register a **Service Catalog product** for API Gateway API creation that:
-
-1. Enforces the mandatory tag policy (§10.1)
-2. Automatically creates a DynamoDB record in the inventory table
-3. Creates a CloudWatch zero-traffic alarm (§10.2)
-4. Assigns a default `lifecycle: active` tag
-5. Sends a welcome notification to the owner with a link to the cleanup policy
-
-### 10.5 Prevention: SCP to Block Untagged API Creation
-
-Optionally enforce tagging at the AWS Organizations level using a Service Control Policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "DenyAPIGatewayWithoutOwnerTag",
-      "Effect": "Deny",
-      "Action": [
-        "apigateway:POST"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "Null": {
-          "aws:RequestTag/owner": "true"
-        }
-      }
-    }
-  ]
-}
-```
-
----
-
-## 11. Appendix: Reference Commands
-
-### Quick Health Check for a Single API
-
-```bash
-API_ID="abc123def"
-REGION="us-east-1"
-
-echo "=== Stages ==="
-aws apigateway get-stages --rest-api-id $API_ID --region $REGION
-
-echo "=== Tags ==="
-aws apigateway get-tags \
-  --resource-arn "arn:aws:apigateway:${REGION}::restapis/${API_ID}"
-
-echo "=== Last 90-day invocation count ==="
-aws cloudwatch get-metric-statistics \
-  --namespace "AWS/ApiGateway" \
-  --metric-name "Count" \
-  --dimensions Name=ApiId,Value=$API_ID \
-  --start-time $(date -u -v-90d '+%Y-%m-%dT%H:%M:%SZ') \
-  --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
-  --period 7776000 \
-  --statistics Sum \
-  --region $REGION
-```
-
-### Bulk List All APIs Across All Regions
-
-```bash
-for region in $(aws account list-regions \
-  --region-opt-status-contains ENABLED \
-  --query 'Regions[].RegionName' --output text); do
-  echo "=== Region: $region ==="
-  aws apigateway get-rest-apis --region $region \
-    --query 'items[*].{ID:id,Name:name}' --output table 2>/dev/null
-  aws apigatewayv2 get-apis --region $region \
-    --query 'Items[*].{ID:ApiId,Name:Name,Type:ProtocolType}' --output table 2>/dev/null
-done
-```
-
-### Find APIs With No Stages (Orphaned)
-
-```bash
-for api_id in $(aws apigateway get-rest-apis --region us-east-1 \
-  --query 'items[*].id' --output text); do
-  stage_count=$(aws apigateway get-stages \
-    --rest-api-id $api_id --region us-east-1 \
-    --query 'length(item)' --output text 2>/dev/null || echo "0")
-  if [ "$stage_count" = "0" ] || [ "$stage_count" = "None" ]; then
-    echo "ORPHANED: $api_id"
-  fi
-done
-```
-
----
-
-*Document maintained by Platform Engineering. For questions or exceptions, contact mdziaur.rahman@corebridgefinancial.com.*
+##
