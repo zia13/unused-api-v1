@@ -310,7 +310,7 @@ The automation defaults to `DRY_RUN=true`. In this mode all pipeline steps execu
 Before any deletion the automation automatically exports the full OpenAPI 3.0 spec and uploads it to the configured S3 archive bucket:
 
 ```
-s3://your-api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json
+s3://api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json
 ```
 
 The S3 bucket is configured with versioning enabled, AES-256 encryption, and a lifecycle policy that transitions objects to Glacier after 90 days with a 7-year retention period.
@@ -322,7 +322,7 @@ If an API needs to be restored after deletion, retrieve the archived spec from S
 ```bash
 # Download spec from S3
 aws s3 cp \
-  s3://your-api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json \
+  s3://api-archive-bucket/api-gateway/<ACCOUNT_ID>/<REGION>/<API_ID>/<DATE>-oas30.json \
   /tmp/<API_ID>-oas30.json
 
 # Re-import REST API from OpenAPI spec
@@ -470,7 +470,7 @@ All settings are controlled via environment variables on the Lambda functions (s
 | Variable | Default | Description |
 |---|---|---|
 | `DYNAMODB_TABLE` | `api-gateway-inventory` | DynamoDB table name |
-| `S3_ARCHIVE_BUCKET` | `your-api-archive-bucket` | S3 bucket for OpenAPI spec archives |
+| `S3_ARCHIVE_BUCKET` | `api-archive-bucket` | S3 bucket for OpenAPI spec archives |
 | `SNS_TOPIC_ARN` | — | SNS topic for orphan alerts |
 | `SES_SENDER_EMAIL` | — | Verified SES sender |
 | `LOOKBACK_DAYS` | `90` | CloudWatch metric look-back window |

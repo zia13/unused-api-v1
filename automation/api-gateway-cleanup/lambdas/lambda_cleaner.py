@@ -31,7 +31,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "api-gateway-inventory")
-S3_ARCHIVE_BUCKET = os.environ.get("S3_ARCHIVE_BUCKET", "your-api-archive-bucket")
+S3_ARCHIVE_BUCKET = os.environ.get("S3_ARCHIVE_BUCKET", "api-archive-bucket")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 SOFT_DELETE_WINDOW_DAYS = int(os.environ.get("SOFT_DELETE_WINDOW_DAYS", "7"))
 

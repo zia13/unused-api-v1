@@ -8,7 +8,7 @@ uploads them to an S3 archive bucket before deletion.
 Usage:
     python archive.py \
         --report ./api-cleanup-report.json \
-        --bucket your-api-archive-bucket \
+        --bucket api-archive-bucket \
         [--tier DORMANT,ORPHANED] \
         [--profile myprofile]
 

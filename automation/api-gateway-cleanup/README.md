@@ -57,7 +57,7 @@ Open `report.csv` — APIs are sorted by severity (ORPHANED → DORMANT → LOW_
 ```bash
 python scripts/archive.py \
   --report ./report.json \
-  --bucket your-api-archive-bucket \
+  --bucket api-archive-bucket \
   --dry-run        # preview first
 ```
 

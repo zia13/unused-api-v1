@@ -9,7 +9,7 @@ dormant_days: 30           # Zero-traffic days before DORMANT classification
 
 # ── AWS ───────────────────────────────────────────────────────────
 dynamodb_table: api-gateway-inventory
-s3_archive_bucket: your-api-archive-bucket
+s3_archive_bucket: api-archive-bucket
 sns_topic_arn: arn:aws:sns:us-east-1:123456789012:api-gateway-orphan-alerts
 ses_sender_email: mdziaur.rahman@corebridgefinancial.com
 
