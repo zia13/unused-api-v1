@@ -22,88 +22,74 @@ writeFile file: 'CreateCatalog.ps1', text: '''
             Write-Host "Start Time: $($startTime.ToString('yyyy-MM-ddTHH:mm:ssZ')) End Time: $($endTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Cyan
 
             try {
-                # First try: Query with ApiId and Stage only (no wildcards)
-                $metricsJson = aws cloudwatch get-metric-statistics `
-                    --namespace AWS/ApiGateway `
-                    --metric-name Count `
-                    --dimensions Name=ApiId,Value=$apiId Name=Stage,Value=$stageName `
-                    --start-time $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                    --end-time $endTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                    --period 86400 `
-                    --statistics Sum `
-                    --region us-east-1 `
-                    --output json
-
-                $metrics = $metricsJson | ConvertFrom-Json
-                Write-Host "Metrics response: $($metrics | ConvertTo-Json -Depth 5)" -ForegroundColor Cyan
-
-                $totalCount = 0
-                if ($metrics.Datapoints -and $metrics.Datapoints.Count -gt 0) {
-                    foreach($datapoint in $metrics.Datapoints) {
-                        $totalCount += $datapoint.Sum
-                    }
-                    Write-Host "Total count for API $apiId stage $stageName : $totalCount" -ForegroundColor Green
-                    return [math]::Round($totalCount)
-                }
-
-                # Second try: Query for all available metrics with Method and Resource dimensions
-                Write-Host "No data with basic dimensions, trying to list all available metrics..." -ForegroundColor Yellow
+                # List all available Count metrics for this API and Stage
+                Write-Host "Listing all available Count metrics for API $apiId stage $stageName..." -ForegroundColor Cyan
                 $availableMetricsJson = aws cloudwatch list-metrics `
                     --namespace AWS/ApiGateway `
+                    --metric-name Count `
                     --dimensions Name=ApiId,Value=$apiId Name=Stage,Value=$stageName `
                     --region us-east-1 `
                     --output json
 
                 $availableMetrics = $availableMetricsJson | ConvertFrom-Json
+                Write-Host "Found $($availableMetrics.Metrics.Count) Count metrics" -ForegroundColor Cyan
 
-                if ($availableMetrics.Metrics -and $availableMetrics.Metrics.Count -gt 0) {
-                    Write-Host "Found $($availableMetrics.Metrics.Count) available metrics" -ForegroundColor Cyan
+                if (-not $availableMetrics.Metrics -or $availableMetrics.Metrics.Count -eq 0) {
+                    Write-Host "No CloudWatch Count metrics found for API $apiId stage $stageName" -ForegroundColor Yellow
+                    return 0
+                }
 
-                    # Query each unique Method/Resource combination
-                    $totalCount = 0
-                    $processedDimensions = @{}
+                # Query each unique dimension combination
+                $totalCount = 0
+                $processedDimensions = @{}
 
-                    foreach($metric in $availableMetrics.Metrics) {
-                        if ($metric.MetricName -ne "Count") { continue }
+                foreach($metric in $availableMetrics.Metrics) {
+                    # Create a unique key for this dimension combination
+                    $sortedDims = $metric.Dimensions | Sort-Object -Property Name
+                    $dimKey = ($sortedDims | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join "|"
 
-                        # Build dimension filter
-                        $dimKey = ($metric.Dimensions | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ","
-                        if ($processedDimensions.ContainsKey($dimKey)) { continue }
-                        $processedDimensions[$dimKey] = $true
+                    if ($processedDimensions.ContainsKey($dimKey)) {
+                        continue
+                    }
+                    $processedDimensions[$dimKey] = $true
 
-                        # Build dimensions parameter
-                        $dimParams = $metric.Dimensions | ForEach-Object { "Name=$($_.Name),Value=$($_.Value)" }
-                        $dimString = $dimParams -join " "
-
-                        $metricDataJson = aws cloudwatch get-metric-statistics `
-                            --namespace AWS/ApiGateway `
-                            --metric-name Count `
-                            --dimensions $dimString `
-                            --start-time $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                            --end-time $endTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                            --period 86400 `
-                            --statistics Sum `
-                            --region us-east-1 `
-                            --output json
-
-                        $metricData = $metricDataJson | ConvertFrom-Json
-                        if ($metricData.Datapoints -and $metricData.Datapoints.Count -gt 0) {
-                            foreach($datapoint in $metricData.Datapoints) {
-                                $totalCount += $datapoint.Sum
-                            }
-                        }
+                    # Build dimensions array for AWS CLI
+                    $dimArgs = @()
+                    foreach($dim in $sortedDims) {
+                        $dimArgs += "Name=$($dim.Name),Value=$($dim.Value)"
                     }
 
-                    if ($totalCount -gt 0) {
-                        Write-Host "Total count from all methods/resources for API $apiId stage $stageName : $totalCount" -ForegroundColor Green
-                        return [math]::Round($totalCount)
+                    Write-Host "  Querying dimensions: $dimKey" -ForegroundColor Gray
+
+                    # Query this specific dimension combination
+                    $metricDataJson = aws cloudwatch get-metric-statistics `
+                        --namespace AWS/ApiGateway `
+                        --metric-name Count `
+                        --dimensions $dimArgs `
+                        --start-time $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
+                        --end-time $endTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
+                        --period 86400 `
+                        --statistics Sum `
+                        --region us-east-1 `
+                        --output json
+
+                    $metricData = $metricDataJson | ConvertFrom-Json
+
+                    if ($metricData.Datapoints -and $metricData.Datapoints.Count -gt 0) {
+                        $subtotal = 0
+                        foreach($datapoint in $metricData.Datapoints) {
+                            $subtotal += $datapoint.Sum
+                        }
+                        Write-Host "    Found $subtotal requests for $dimKey" -ForegroundColor Green
+                        $totalCount += $subtotal
                     }
                 }
 
-                Write-Host "No CloudWatch data found for API $apiId stage $stageName (may not have detailed metrics enabled)" -ForegroundColor Yellow
-                return 0
+                Write-Host "Total count for API $apiId stage $stageName: $totalCount" -ForegroundColor Green
+                return [math]::Round($totalCount)
             } catch {
                 Write-Host "Warning: Failed to get metrics for API $apiId stage $stageName - Error: $_" -ForegroundColor Red
+                Write-Host "Error details: $($_.Exception.Message)" -ForegroundColor Red
                 return 0
             }
         }
