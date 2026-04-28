@@ -93,9 +93,39 @@ pipeline {
         // ── 1. Checkout ───────────────────────────────────────────────────────
         stage('Checkout') {
             steps {
-                checkout scm
-                sh "mkdir -p ${BUILD_DIR}"
-                echo "✅ Checked out — branch: ${env.GIT_BRANCH ?: 'unknown'}"
+                script {
+                    // Option 1: Use SCM (automatic - recommended for multibranch pipelines)
+                    checkout scm
+
+                    // Option 2: Explicit Git checkout (uncomment if you need specific configuration)
+                    /*
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],  // or '*/master', '*/develop', etc.
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/your-org/unused-api.git',
+                            credentialsId: 'github-credentials-id'  // Configure in Jenkins credentials
+                        ]],
+                        extensions: [
+                            [$class: 'CleanBeforeCheckout'],
+                            [$class: 'CloneOption', depth: 1, shallow: true]  // Shallow clone for speed
+                        ]
+                    ])
+                    */
+
+                    // Create build directory
+                    sh "mkdir -p ${BUILD_DIR}"
+
+                    // Display Git information
+                    def gitBranch = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    def gitCommit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    def gitAuthor = sh(script: 'git log -1 --pretty=format:"%an"', returnStdout: true).trim()
+
+                    echo "✅ Git Checkout Complete"
+                    echo "   Branch:  ${gitBranch}"
+                    echo "   Commit:  ${gitCommit}"
+                    echo "   Author:  ${gitAuthor}"
+                }
             }
         }
 

@@ -1,259 +1,371 @@
 node('windows'){
-stage('create script') {
-writeFile file: 'CreateCatalog.ps1', text: '''
+
+    stage('create script') {
+
+        writeFile file: 'CreateCatalog.ps1', text: '''
+
         param(
+
             [string]$accountId,
+
             [string]$accountName,
+
             [int]$index,
+
             [string]$env
+
         )
 
+
+
         # Helper function to get CloudWatch request count
+
         function Get-ApiRequestCount {
+
             param(
+
                 [string]$apiId,
+
                 [string]$stageName,
+
                 [int]$days = 10
+
             )
 
+
+
             Write-Host "Inside Get-ApiRequestCount ---> Getting CloudWatch metrics for API ID: $($apiId) Stage: $($stageName)" -ForegroundColor Cyan
-            $endTime = (Get-Date).ToUniversalTime()
-            $startTime = $endTime.AddDays(-$days)
-            Write-Host "Start Time: $($startTime.ToString('yyyy-MM-ddTHH:mm:ssZ')) End Time: $($endTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))" -ForegroundColor Cyan
+
+            $endTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+            $startTime = (Get-Date).AddDays(-$days).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+            Write-Host "Start Time: $($startTime) End Time: $($endTime)" -ForegroundColor Cyan
+
+
 
             try {
-                # First try: Query with ApiId and Stage only (no wildcards)
+
                 $metricsJson = aws cloudwatch get-metric-statistics `
+
                     --namespace AWS/ApiGateway `
+
                     --metric-name Count `
-                    --dimensions Name=ApiId,Value=$apiId Name=Stage,Value=$stageName `
-                    --start-time $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                    --end-time $endTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                    --period 86400 `
+
+                    --dimensions Name=ApiId,Value=$apiId Name=Stage,Value=$stageName Name=Method,Value=* Name=Resource,Value=/* `
+
+                    --start-time $startTime `
+
+                    --end-time $endTime `
+
+                    --period 3600 `
+
                     --statistics Sum `
+
                     --region us-east-1 `
+
                     --output json
+
+
 
                 $metrics = $metricsJson | ConvertFrom-Json
-                Write-Host "Metrics response: $($metrics | ConvertTo-Json -Depth 5)" -ForegroundColor Cyan
+
+                Write-Host ($metrics | ConvertTo-Json -Depth 5)
+
+
 
                 $totalCount = 0
-                if ($metrics.Datapoints -and $metrics.Datapoints.Count -gt 0) {
-                    foreach($datapoint in $metrics.Datapoints) {
-                        $totalCount += $datapoint.Sum
-                    }
-                    Write-Host "Total count for API $apiId stage $stageName : $totalCount" -ForegroundColor Green
-                    return [math]::Round($totalCount)
+
+                foreach($datapoint in $metrics.Datapoints) {
+
+                    $totalCount += $datapoint.Sum
+
                 }
 
-                # Second try: Query for all available metrics with Method and Resource dimensions
-                Write-Host "No data with basic dimensions, trying to list all available metrics..." -ForegroundColor Yellow
-                $availableMetricsJson = aws cloudwatch list-metrics `
-                    --namespace AWS/ApiGateway `
-                    --dimensions Name=ApiId,Value=$apiId Name=Stage,Value=$stageName `
-                    --region us-east-1 `
-                    --output json
+                return [math]::Round($totalCount)
 
-                $availableMetrics = $availableMetricsJson | ConvertFrom-Json
-
-                if ($availableMetrics.Metrics -and $availableMetrics.Metrics.Count -gt 0) {
-                    Write-Host "Found $($availableMetrics.Metrics.Count) available metrics" -ForegroundColor Cyan
-
-                    # Query each unique Method/Resource combination
-                    $totalCount = 0
-                    $processedDimensions = @{}
-
-                    foreach($metric in $availableMetrics.Metrics) {
-                        if ($metric.MetricName -ne "Count") { continue }
-
-                        # Build dimension filter
-                        $dimKey = ($metric.Dimensions | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ","
-                        if ($processedDimensions.ContainsKey($dimKey)) { continue }
-                        $processedDimensions[$dimKey] = $true
-
-                        # Build dimensions parameter
-                        $dimParams = $metric.Dimensions | ForEach-Object { "Name=$($_.Name),Value=$($_.Value)" }
-                        $dimString = $dimParams -join " "
-
-                        $metricDataJson = aws cloudwatch get-metric-statistics `
-                            --namespace AWS/ApiGateway `
-                            --metric-name Count `
-                            --dimensions $dimString `
-                            --start-time $startTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                            --end-time $endTime.ToString("yyyy-MM-ddTHH:mm:ssZ") `
-                            --period 86400 `
-                            --statistics Sum `
-                            --region us-east-1 `
-                            --output json
-
-                        $metricData = $metricDataJson | ConvertFrom-Json
-                        if ($metricData.Datapoints -and $metricData.Datapoints.Count -gt 0) {
-                            foreach($datapoint in $metricData.Datapoints) {
-                                $totalCount += $datapoint.Sum
-                            }
-                        }
-                    }
-
-                    if ($totalCount -gt 0) {
-                        Write-Host "Total count from all methods/resources for API $apiId stage $stageName : $totalCount" -ForegroundColor Green
-                        return [math]::Round($totalCount)
-                    }
-                }
-
-                Write-Host "No CloudWatch data found for API $apiId stage $stageName (may not have detailed metrics enabled)" -ForegroundColor Yellow
-                return 0
             } catch {
-                Write-Host "Warning: Failed to get metrics for API $apiId stage $stageName - Error: $_" -ForegroundColor Red
+
+                Write-Host "Warning: Failed to get metrics for API $apiId stage $stageName" -ForegroundColor Yellow
+
                 return 0
+
             }
+
         }
+
+
 
         $apimap = @{}
+
         $apilist = aws apigateway get-rest-apis | ConvertFrom-Json
+
         foreach($api in $apilist.items) {
+
             $apimap[$api.id] = $api.name
+
         }
+
+
 
         $vpclinkmap = @{}
+
         $vpclinklist = aws apigateway get-vpc-links | ConvertFrom-Json
+
         foreach($vpclink in $vpclinklist.items) {
+
             $vpclinkmap[$vpclink.id] = $vpclink.name
+
         }
+
         Write-Host "Index,API Name,API Id,basePath,stage,domainName,Authorizer Name,Integration Type,Integration Uri,Integration Timeout,Account Name,Account Id,Count"
+
         $domains = aws apigateway get-domain-names | ConvertFrom-Json
+
         foreach($domain in $domains.items) {
+
             #Write-Host "$($domain)"
+
             if (-not $domain.domainName.EndsWith("apigateway.corebridgefinancial.com")) {
+
                 continue
+
             }
+
             $mappings = aws apigateway get-base-path-mappings --domain-name $domain.domainName | ConvertFrom-Json
+
             foreach ($mapping in $mappings.items) {
+
                 if ($mapping.basepath -eq "(none)" -or [string]::IsNullOrEmpty($mapping.basepath)) {
+
                     continue
+
                 }
+
                 #Write-Host "$($mapping)"
+
                 $spec = aws apigateway get-export `
+
                     --rest-api-id $mapping.restApiId `
+
                     --stage-name $mapping.stage `
+
                     --export-type oas30 `
+
                     --parameters extensions='apigateway' `
+
                     output.json
+
                 try {
+
                     $content = Get-Content output.json -Raw | ConvertFrom-Json
+
                 } catch {
+
                     #dghjdg
+
                 }
+
+
 
                 $authorizeruris = $content.components.securitySchemes.PSObject.Properties | ForEach-Object {
+
                     $_.Value."x-amazon-apigateway-authorizer".authorizerUri
+
                 }
+
                 $lambdaAuthorizerName = ""
+
                 $authorizeruris | ForEach-Object {
+
                     if($_ -match "function:([^/]+)") {
+
                         $lambdaAuthorizerName = $Matches[1]
+
                     }
+
                 }
+
+
 
                 $firstpathprop = $content.paths.PSObject.Properties | Select-Object -First 1
+
                 $pathname = $firstpathprop.Name
 
+
+
                 $firstmethodprop = $firstpathprop.Value.PSObject.Properties | Select-Object -First 1
+
                 $methodname = $firstmethodprop.Name
 
+
+
                 $integrationType = ""
+
                 $integrationUri = ""
+
                 $integrationConnectionId = ""
+
                 $timeoutInMillis = ""
+
                 $integration = $firstmethodprop.Value."x-amazon-apigateway-integration"
+
                 if($integration) {
+
                     $integrationType = $integration.type
+
                     $integrationUri = $integration.uri
+
                     $integrationConnectionId = $integration.connectionId
+
                     $timeoutInMillis = $integration.timeoutInMillis
+
                     $integrationConnectionType = $integration.connectionType
+
                     if($integrationConnectionType -eq "VPC_LINK" -and $integrationConnectionId) {
+
                         $integrationType = "vpc link"
+
                         $integrationUri = $vpclinkmap[$integrationConnectionId]
+
                     }
+
                     if($integrationType -eq "aws_proxy" -and $integrationUri -match "function:([^/]+)") {
+
                         $integrationType = "lambda"
+
                         $integrationUri = $Matches[1]
+
                     }
+
                 }
+
+
 
                 # Get CloudWatch request count for the last 90 days
+
                 Write-Host "Getting CloudWatch metrics for API Id: $($mapping.restApiId) Stage: $($mapping.stage)" -ForegroundColor Cyan
+
                 $requestCount = Get-ApiRequestCount -apiId $mapping.restApiId -stageName $mapping.stage
 
+
+
                 $index++
+
                 Write-Host "$index,$($apimap[$mapping.restApiId]),$($mapping.restApiId),$($mapping.basePath),$($mapping.stage),$($domain.domainName),$($lambdaAuthorizerName),$($integrationType),$($integrationUri),$($timeoutInMillis),$($accountName),$($accountId),$requestCount"
+
                 $result = [PSCustomObject]@{
+
                     Index = $index
+
                     ApiName = $apimap[$mapping.restApiId]
+
                     ApiId = $mapping.restApiId
+
                     Basepath = $mapping.basePath
+
                     Stage = $mapping.stage
+
                     Domain = $domain.domainName
+
                     Authorizer = $lambdaAuthorizerName
+
                     IntegrationType = $integrationType
+
                     IntegrationUri = $integrationUri
+
                     IntegrationTimeout = $timeoutInMillis
+
                     AccountId = $accountId
+
                     AccountName = $accountName
+
                     Count = $requestCount
+
                 }
+
                 $filename = "${env}_apigateway_report.csv"
+
                 $result | Export-Csv $filename -Append -NoTypeInformation
+
             }
+
         }
+
         return $index
+
         '''
-}
-stage('Remove old csv') {
-powershell """
+
+    }
+
+    stage('Remove old csv') {
+
+        powershell """
+
         Remove-Item apigateway_report.csv -ErrorAction SilentlyContinue
+
         """
-}
-stage('Create Catalog'){
-def awsDefaultRegion = "us-east-1"
-def awsDefaultOutput = "json"
-def awsAccountsArr = (params.TriggerType = = "Manual")?params.awsAccounts.split(','): params.PeriodicAwsAccounts.split(',')
-def environment = params.Environment
-echo "awsAccounts :: ${awsAccountsArr
-}"
-echo "Environment :: ${environment
-}"
-def serialno = 0
-for (awsAccountWithName in awsAccountsArr) {
-def awsAccount = awsAccountWithName.split('/')
-def awsAccountName = awsAccount[0]
-def awsAccountID = awsAccount[1]
-withEnv(["AWS_DEFAULT_REGION=${awsDefaultRegion
-}", "AWS_DEFAULT_OUTPUT=${awsDefaultOutput
-}"]) {
-withCredentials([[$class: 'StringBinding', credentialsId: "${awsAccountID
-}-lrdevops-aws-access-key", variable: 'AWS_ACCESS_KEY_ID'], [$class: 'StringBinding', credentialsId: "${awsAccountID
-}-lrdevops-aws-secret-key", variable: 'AWS_SECRET_ACCESS_KEY']])
-{
-echo "cmdResponse :::${awsAccountID
-} ${awsAccountName
-}"
-serialno = powershell(
-script: """
-                        .\\CreateCatalog.ps1 -accountId ${awsAccountID
-} -accountName "${awsAccountName
-}" -index ${serialno
-} -env ${environment
-}
+
+    }
+
+    stage('Create Catalog'){
+
+        def awsDefaultRegion = "us-east-1"
+
+        def awsDefaultOutput = "json"
+
+        def awsAccountsArr = (params.TriggerType == "Manual")?params.awsAccounts.split(','):params.PeriodicAwsAccounts.split(',')
+
+        def environment = params.Environment
+
+        echo "awsAccounts :: ${awsAccountsArr}"
+
+        echo "Environment :: ${environment}"
+
+        def serialno = 0
+
+        for (awsAccountWithName in awsAccountsArr) {
+
+            def awsAccount = awsAccountWithName.split('/')
+
+            def awsAccountName = awsAccount[0]
+
+            def awsAccountID = awsAccount[1]
+
+            withEnv(["AWS_DEFAULT_REGION=${awsDefaultRegion}", "AWS_DEFAULT_OUTPUT=${awsDefaultOutput}"]) {
+
+                withCredentials([[$class: 'StringBinding', credentialsId: "${awsAccountID}-lrdevops-aws-access-key" , variable: 'AWS_ACCESS_KEY_ID'],[$class: 'StringBinding', credentialsId: "${awsAccountID}-lrdevops-aws-secret-key", variable: 'AWS_SECRET_ACCESS_KEY']])
+
+                {
+
+                    echo "cmdResponse :::${awsAccountID} ${awsAccountName}"
+
+                    serialno = powershell(
+
+                        script: """
+
+                        .\\CreateCatalog.ps1 -accountId ${awsAccountID} -accountName "${awsAccountName}" -index ${serialno} -env ${environment}
+
                         """,
-returnStdout: true
-).trim().toInteger()
-}
-}
-}
-}
-stage('Archive csv'){
-archiveArtifacts artifacts: '**/*.csv',
-fingerprint: true
-}
+
+                        returnStdout: true
+
+                    ).trim().toInteger()
+
+                }
+
+            }
+
+        }
+
+    }
+
+    stage('Archive csv'){
+
+        archiveArtifacts artifacts: '**/*.csv',
+
+        fingerprint: true
+
+    }
+
 }
