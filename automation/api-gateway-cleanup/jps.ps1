@@ -11,7 +11,7 @@ writeFile file: 'CreateCatalog.ps1', text: '''
         # Helper function to get CloudWatch request count
         function Get-ApiRequestCount {
             param(
-                [string]$apiId,
+                [string]$apiName,
                 [string]$stageName,
                 [int]$days = 10
             )

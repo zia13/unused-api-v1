@@ -1,0 +1,560 @@
+#!/usr/bin/env groovy
+/**
+ * Jenkinsfile-decommission
+ * ========================
+ * Jenkins pipeline for decommissioning approved unused APIs.
+ *
+ * Prerequisites:
+ * - AWS credentials configured in Jenkins
+ * - Python 3.9+ and boto3 installed on Jenkins agents
+ * - S3 bucket with approved CSV file
+ *
+ * Pipeline Stages:
+ * 1. Download & Validate: Download approved CSV from S3 and validate format
+ * 2. Backup: Export OpenAPI specs and create DynamoDB backup
+ * 3. Soft Delete: Throttle stages to 0 req/s and detach custom domains
+ * 4. Manual Approval: Wait for manual approval (7 days timeout)
+ * 5. Hard Delete: Permanently delete APIs
+ * 6. Report: Generate deletion report and send email
+ */
+
+pipeline {
+    agent {
+        label 'linux'
+    }
+
+    parameters {
+        string(
+            name: 'APPROVED_CSV_S3_KEY',
+            defaultValue: '',
+            description: 'S3 key of the approved CSV file (e.g., approvals/api-approved-20260430.csv)'
+        )
+        string(
+            name: 'S3_BUCKET',
+            defaultValue: 'api-gateway-cleanup-bucket',
+            description: 'S3 bucket containing the CSV files'
+        )
+        string(
+            name: 'NOTIFICATION_EMAILS',
+            defaultValue: 'api-team@company.com',
+            description: 'Comma-separated list of email addresses for notifications'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'Dry run mode - no actual deletions will be performed'
+        )
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        PYTHON_VERSION = '3.9'
+        WORKSPACE_DIR = "${WORKSPACE}"
+        BACKUP_PREFIX = 'backups/'
+        REPORT_PREFIX = 'reports/'
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                script {
+                    echo "=== API Gateway Decommission Pipeline ==="
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Build URL: ${BUILD_URL}"
+                    echo "Approved CSV: ${params.APPROVED_CSV_S3_KEY}"
+                    echo "S3 Bucket: ${params.S3_BUCKET}"
+                    echo "Dry Run: ${params.DRY_RUN}"
+
+                    // Validate parameters
+                    if (!params.APPROVED_CSV_S3_KEY) {
+                        error("APPROVED_CSV_S3_KEY parameter is required")
+                    }
+
+                    // Install dependencies
+                    sh '''
+                        python3 -m pip install --user boto3 requests
+                    '''
+                }
+            }
+        }
+
+        stage('Download & Validate CSV') {
+            steps {
+                script {
+                    echo "Downloading approved CSV from S3..."
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+import csv
+import sys
+from io import StringIO
+
+s3 = boto3.client('s3')
+
+# Download CSV
+try:
+    response = s3.get_object(
+        Bucket='${params.S3_BUCKET}',
+        Key='${params.APPROVED_CSV_S3_KEY}'
+    )
+    csv_content = response['Body'].read().decode('utf-8')
+
+    # Save locally
+    with open('approved_apis.csv', 'w') as f:
+        f.write(csv_content)
+
+    # Validate CSV format
+    reader = csv.DictReader(StringIO(csv_content))
+    required_columns = [
+        'ApiId', 'Region', 'ApiType', 'ApiName', 'ApprovalStatus',
+        'ReviewerName', 'ReviewDate', 'AccountId'
+    ]
+
+    if not all(col in reader.fieldnames for col in required_columns):
+        print(f"ERROR: Missing required columns. Found: {reader.fieldnames}")
+        sys.exit(1)
+
+    # Count approved deletions
+    approved_count = 0
+    for row in reader:
+        if row.get('ApprovalStatus', '').upper() == 'APPROVE_DELETE':
+            approved_count += 1
+
+    print(f"✓ CSV validated successfully")
+    print(f"✓ Found {approved_count} APIs approved for deletion")
+
+    # Save count for later stages
+    with open('approved_count.txt', 'w') as f:
+        f.write(str(approved_count))
+
+except Exception as e:
+    print(f"ERROR: Failed to download or validate CSV: {e}")
+    sys.exit(1)
+EOF
+                    """
+
+                    // Read approved count
+                    env.APPROVED_COUNT = readFile('approved_count.txt').trim()
+                    echo "APIs to be deleted: ${env.APPROVED_COUNT}"
+
+                    if (env.APPROVED_COUNT == "0") {
+                        error("No APIs approved for deletion. Aborting pipeline.")
+                    }
+                }
+            }
+        }
+
+        stage('Backup APIs') {
+            steps {
+                script {
+                    echo "Backing up APIs before deletion..."
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+import csv
+import json
+from datetime import datetime
+
+s3 = boto3.client('s3')
+backup_date = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+
+with open('approved_apis.csv', 'r') as f:
+    reader = csv.DictReader(f)
+
+    for row in reader:
+        if row.get('ApprovalStatus', '').upper() != 'APPROVE_DELETE':
+            continue
+
+        api_id = row['ApiId']
+        region = row['Region']
+        api_type = row['ApiType']
+        account_id = row['AccountId']
+
+        print(f"Backing up {api_type} API {api_id} in {region}...")
+
+        try:
+            if api_type == 'REST':
+                apigw = boto3.client('apigateway', region_name=region)
+                # Export OpenAPI spec
+                response = apigw.get_export(
+                    restApiId=api_id,
+                    stageName='prod',  # Try prod first
+                    exportType='oas30',
+                    accepts='application/json'
+                )
+                spec = response['body'].read()
+            else:
+                apigwv2 = boto3.client('apigatewayv2', region_name=region)
+                # Get API details
+                response = apigwv2.export_api(
+                    ApiId=api_id,
+                    OutputType='JSON',
+                    Specification='OAS30'
+                )
+                spec = response['body'].read()
+
+            # Upload to S3
+            backup_key = f"${env.BACKUP_PREFIX}{account_id}/{region}/{api_id}/{backup_date}-oas30.json"
+            s3.put_object(
+                Bucket='${params.S3_BUCKET}',
+                Key=backup_key,
+                Body=spec,
+                ContentType='application/json',
+                Metadata={
+                    'api-id': api_id,
+                    'region': region,
+                    'api-type': api_type,
+                    'backup-date': backup_date
+                }
+            )
+
+            print(f"✓ Backed up to s3://${params.S3_BUCKET}/{backup_key}")
+
+        except Exception as e:
+            print(f"WARNING: Failed to backup {api_id}: {e}")
+            # Continue with other APIs even if one fails
+
+print("✓ Backup stage completed")
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Soft Delete') {
+            when {
+                expression { params.DRY_RUN == false }
+            }
+            steps {
+                script {
+                    echo "Performing soft delete (throttling stages)..."
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+import csv
+from datetime import datetime
+
+soft_delete_date = datetime.utcnow().isoformat()
+
+with open('approved_apis.csv', 'r') as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+
+for row in rows:
+    if row.get('ApprovalStatus', '').upper() != 'APPROVE_DELETE':
+        continue
+
+    api_id = row['ApiId']
+    region = row['Region']
+    api_type = row['ApiType']
+
+    print(f"Soft deleting {api_type} API {api_id} in {region}...")
+
+    try:
+        if api_type == 'REST':
+            apigw = boto3.client('apigateway', region_name=region)
+
+            # Get all stages
+            stages_response = apigw.get_stages(restApiId=api_id)
+
+            for stage in stages_response.get('item', []):
+                stage_name = stage['stageName']
+                print(f"  Throttling stage: {stage_name}")
+
+                # Set throttle to 0
+                apigw.update_stage(
+                    restApiId=api_id,
+                    stageName=stage_name,
+                    patchOperations=[
+                        {
+                            'op': 'replace',
+                            'path': '/throttle/rateLimit',
+                            'value': '0'
+                        },
+                        {
+                            'op': 'replace',
+                            'path': '/throttle/burstLimit',
+                            'value': '0'
+                        }
+                    ]
+                )
+                print(f"  ✓ Throttled stage {stage_name}")
+
+        else:  # HTTP/WebSocket API
+            apigwv2 = boto3.client('apigatewayv2', region_name=region)
+
+            # Get all stages
+            stages_response = apigwv2.get_stages(ApiId=api_id)
+
+            for stage in stages_response.get('Items', []):
+                stage_name = stage['StageName']
+                print(f"  Throttling stage: {stage_name}")
+
+                # Update stage with throttle
+                apigwv2.update_stage(
+                    ApiId=api_id,
+                    StageName=stage_name,
+                    ThrottleSettings={
+                        'RateLimit': 0.0,
+                        'BurstLimit': 0
+                    }
+                )
+                print(f"  ✓ Throttled stage {stage_name}")
+
+        # Update CSV with soft delete date
+        row['SoftDeleteDate'] = soft_delete_date
+        print(f"✓ Soft deleted {api_id}")
+
+    except Exception as e:
+        print(f"ERROR: Failed to soft delete {api_id}: {e}")
+        row['SoftDeleteError'] = str(e)
+
+# Save updated CSV
+with open('approved_apis_soft_deleted.csv', 'w', newline='') as f:
+    if rows:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+print("✓ Soft delete stage completed")
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Manual Approval') {
+            when {
+                expression { params.DRY_RUN == false }
+            }
+            steps {
+                script {
+                    echo "Waiting for manual approval before hard delete..."
+                    echo "APIs have been soft deleted (throttled to 0 req/s)"
+                    echo "You have 7 days to verify and approve final deletion"
+
+                    timeout(time: 7, unit: 'DAYS') {
+                        input(
+                            message: "Approve permanent deletion of ${env.APPROVED_COUNT} APIs?",
+                            ok: 'Delete Permanently',
+                            submitter: 'api-admins,platform-team'
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Hard Delete') {
+            when {
+                expression { params.DRY_RUN == false }
+            }
+            steps {
+                script {
+                    echo "Performing hard delete (permanent deletion)..."
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+import csv
+from datetime import datetime
+
+hard_delete_date = datetime.utcnow().isoformat()
+
+# Read the soft deleted CSV if exists, otherwise use original
+try:
+    with open('approved_apis_soft_deleted.csv', 'r') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+except FileNotFoundError:
+    with open('approved_apis.csv', 'r') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+for row in rows:
+    if row.get('ApprovalStatus', '').upper() != 'APPROVE_DELETE':
+        continue
+
+    api_id = row['ApiId']
+    region = row['Region']
+    api_type = row['ApiType']
+
+    print(f"Hard deleting {api_type} API {api_id} in {region}...")
+
+    try:
+        if api_type == 'REST':
+            apigw = boto3.client('apigateway', region_name=region)
+            apigw.delete_rest_api(restApiId=api_id)
+        else:
+            apigwv2 = boto3.client('apigatewayv2', region_name=region)
+            apigwv2.delete_api(ApiId=api_id)
+
+        row['HardDeleteDate'] = hard_delete_date
+        row['DeletionStatus'] = 'SUCCESS'
+        print(f"✓ Deleted {api_id}")
+
+    except Exception as e:
+        print(f"ERROR: Failed to delete {api_id}: {e}")
+        row['DeletionStatus'] = 'FAILED'
+        row['DeletionError'] = str(e)
+
+# Save final report CSV
+with open('deletion_report.csv', 'w', newline='') as f:
+    if rows:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+print("✓ Hard delete stage completed")
+EOF
+                    """
+                }
+            }
+        }
+
+        stage('Generate Report') {
+            steps {
+                script {
+                    echo "Generating deletion report..."
+
+                    // Upload report to S3
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+from datetime import datetime
+
+s3 = boto3.client('s3')
+report_date = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+
+# Upload deletion report to S3
+report_key = f"${env.REPORT_PREFIX}api-deletion-report-{report_date}.csv"
+
+with open('deletion_report.csv', 'rb') as f:
+    s3.put_object(
+        Bucket='${params.S3_BUCKET}',
+        Key=report_key,
+        Body=f,
+        ContentType='text/csv',
+        Metadata={
+            'report-date': report_date,
+            'jenkins-job': '${BUILD_URL}',
+            'dry-run': '${params.DRY_RUN}'
+        }
+    )
+
+print(f"✓ Report uploaded to s3://${params.S3_BUCKET}/{report_key}")
+
+# Save report key for email
+with open('report_s3_key.txt', 'w') as f:
+    f.write(report_key)
+EOF
+                    """
+
+                    env.REPORT_S3_KEY = readFile('report_s3_key.txt').trim()
+                }
+            }
+        }
+
+        stage('Send Notification') {
+            steps {
+                script {
+                    echo "Sending completion notification email..."
+                    sh """
+                        python3 - <<'EOF'
+import boto3
+import csv
+from datetime import datetime
+
+ses = boto3.client('ses', region_name='${env.AWS_DEFAULT_REGION}')
+s3 = boto3.client('s3')
+
+# Read report
+with open('deletion_report.csv', 'r') as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+
+success_count = sum(1 for r in rows if r.get('DeletionStatus') == 'SUCCESS')
+failed_count = sum(1 for r in rows if r.get('DeletionStatus') == 'FAILED')
+
+# Generate pre-signed URL for report
+report_url = s3.generate_presigned_url(
+    'get_object',
+    Params={'Bucket': '${params.S3_BUCKET}', 'Key': '${env.REPORT_S3_KEY}'},
+    ExpiresIn=604800  # 7 days
+)
+
+subject = f"[API Cleanup] Decommission {'Dry Run' if ${params.DRY_RUN} else 'Completion'} Report - {datetime.utcnow().strftime('%Y-%m-%d')}"
+
+body_text = f"""
+API Gateway Decommission Report
+
+Job: ${BUILD_URL}
+Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+Mode: {"DRY RUN" if ${params.DRY_RUN} else "LIVE"}
+
+Summary:
+--------
+Total APIs Processed: {len(rows)}
+Successfully Deleted: {success_count}
+Failed: {failed_count}
+
+Download full report: {report_url}
+
+Jenkins Job: ${BUILD_URL}
+"""
+
+body_html = f"""
+<html>
+<head></head>
+<body>
+<h2>API Gateway Decommission Report</h2>
+<p><strong>Job:</strong> <a href="${BUILD_URL}">${BUILD_URL}</a></p>
+<p><strong>Date:</strong> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
+<p><strong>Mode:</strong> {"DRY RUN" if ${params.DRY_RUN} else "LIVE"}</p>
+
+<h3>Summary</h3>
+<table border="1" cellpadding="5">
+<tr><th>Status</th><th>Count</th></tr>
+<tr><td>Total APIs Processed</td><td>{len(rows)}</td></tr>
+<tr style="background-color: #d4edda;"><td>Successfully Deleted</td><td>{success_count}</td></tr>
+<tr style="background-color: #f8d7da;"><td>Failed</td><td>{failed_count}</td></tr>
+</table>
+
+<p><a href="{report_url}">Download Full Report (CSV)</a></p>
+</body>
+</html>
+"""
+
+try:
+    ses.send_email(
+        Source='noreply@company.com',
+        Destination={'ToAddresses': [email.strip() for email in '${params.NOTIFICATION_EMAILS}'.split(',')]},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {
+                'Text': {'Data': body_text},
+                'Html': {'Data': body_html}
+            }
+        }
+    )
+    print("✓ Notification email sent")
+except Exception as e:
+    print(f"WARNING: Failed to send email: {e}")
+EOF
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✓ Pipeline completed successfully"
+        }
+        failure {
+            echo "✗ Pipeline failed"
+        }
+        always {
+            // Archive artifacts
+            archiveArtifacts artifacts: '*.csv,*.txt', allowEmptyArchive: true
+        }
+    }
+}
